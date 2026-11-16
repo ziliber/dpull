@@ -12,6 +12,7 @@ import (
 
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker"
+	"github.com/containers/image/v5/docker/daemon"
 	"github.com/containers/image/v5/signature"
 	"github.com/containers/image/v5/types"
 	"github.com/distribution/reference"
@@ -101,13 +102,9 @@ func DoCopy(ctx context.Context, src, dst *Endpoint, source, dstTag string, opts
 	}
 
 	// 5. 安全策略：不要求签名
-	policy, err := signature.DefaultPolicy(&types.SystemContext{})
+	policyCtx, err := defaultPolicyCtx()
 	if err != nil {
-		return nil, fmt.Errorf("构造默认策略: %w", err)
-	}
-	policyCtx, err := signature.NewPolicyContext(policy)
-	if err != nil {
-		return nil, fmt.Errorf("构造策略上下文: %w", err)
+		return nil, err
 	}
 	defer policyCtx.Destroy()
 
@@ -175,4 +172,84 @@ func defaultRegistry(r string) bool {
 		return true
 	}
 	return false
+}
+
+// defaultPolicyCtx 构造"仅本地信任、不要求远程签名"的默认安全策略上下文。
+// 对本工具（拉取/分发，不验证签名）足够；与 skopeo 默认行为一致。
+func defaultPolicyCtx() (*signature.PolicyContext, error) {
+	policy, err := signature.DefaultPolicy(&types.SystemContext{})
+	if err != nil {
+		return nil, fmt.Errorf("构造默认策略: %w", err)
+	}
+	policyCtx, err := signature.NewPolicyContext(policy)
+	if err != nil {
+		return nil, fmt.Errorf("构造策略上下文: %w", err)
+	}
+	return policyCtx, nil
+}
+
+// DoCopyToDaemon 将源镜像复制到本机（或指定）docker daemon，使 `docker images` 立即可见。
+// 通过 docker-daemon transport 走 unix socket（Linux）或 npipe（Windows），不调用外部 docker CLI。
+//
+//   - src 为源 registry 端点（认证、TLS、代理、平台）。
+//   - source 为源镜像引用，如 "nginx"、"nginx:1.25"、"myreg:5000/foo/bar:1.0"。
+//   - daemonHost 指定 daemon 地址，如 "unix:///var/run/docker.sock"、""（默认）
+//     或 "tcp://127.0.0.1:2375"；可用 DOCKER_HOST 语义覆盖。
+//   - opts.Platform 用于多架构镜像选择平台；daemon 只能接收单平台，故该参数通常必填。
+//
+// 目标 tag 与 source 相同（无 tag 默认 latest）。
+func DoCopyToDaemon(ctx context.Context, src *Endpoint, source, daemonHost string, opts CopyOpts) (*CopyResult, error) {
+	// 1. 解析源引用
+	srcNamed, inferredRegistry, err := ParseSourceRef(source)
+	if err != nil {
+		return nil, err
+	}
+	if src.Registry == "" || defaultRegistry(src.Registry) {
+		src.Registry = inferredRegistry
+	}
+
+	// 2. docker daemon 目标引用：必须是 name:tag（NamedTagged）
+	dstRef, err := daemonDestRef(srcNamed)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. 源引用
+	srcRef, err := docker.NewReference(srcNamed)
+	if err != nil {
+		return nil, fmt.Errorf("构造源引用: %w", err)
+	}
+
+	// 4. 安全策略
+	policyCtx, err := defaultPolicyCtx()
+	if err != nil {
+		return nil, err
+	}
+	defer policyCtx.Destroy()
+
+	// 5. SystemContext：源带平台/认证/代理；目标指定 daemon 地址
+	srcSys := readSysCtx(src, opts.Platform)
+	dstSys := &types.SystemContext{DockerDaemonHost: daemonHost}
+
+	// 6. 执行复制（registry 源 → docker daemon 目标）
+	manifest, err := copy.Image(ctx, policyCtx, dstRef, srcRef, &copy.Options{
+		SourceCtx:            srcSys,
+		DestinationCtx:       dstSys,
+		MaxParallelDownloads: opts.MaxParallel,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("复制镜像到 docker daemon: %w", err)
+	}
+	return &CopyResult{CopiedManifest: manifest}, nil
+}
+
+// daemonDestRef 由源引用构造 docker daemon 目标引用。
+// 经 FamiliarString 规整为可读短名（如 "nginx:latest"）再解析，由 daemon transport 处理。
+func daemonDestRef(srcNamed reference.Named) (types.ImageReference, error) {
+	familiar := reference.FamiliarString(srcNamed)
+	ref, err := daemon.ParseReference(familiar)
+	if err != nil {
+		return nil, fmt.Errorf("构造 daemon 目标引用 %q: %w", familiar, err)
+	}
+	return ref, nil
 }

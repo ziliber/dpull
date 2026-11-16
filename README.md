@@ -4,14 +4,15 @@
 
 底层使用 Go 官方生态的 [containers/image](https://github.com/containers/image)（`skopeo` / `podman` 同款引擎），正确处理 bearer token、OCI index / manifest list、digest 校验等繁琐细节，你只需关注目标。
 
-- **`pull`**：从远程仓库拉取镜像并**推送**到目标 registry（如本地/内网 registry）
+- **`pull`**：拉取镜像——**默认送到本机 docker daemon**（`docker images` 立即可见），也可 `--to` 推送到目标 registry
 - **`copy`**：将一个源镜像**并发分发**到多个目标 registry
 
 支持 Docker Hub（官方仓库）、私有仓库、HTTPS/SOCKS5 代理。静态编译，适合在无 docker 的服务器、K8s、边缘设备上使用。
 
 ## 特性
 
-- ✅ **纯 Registry API**：通过 containers/image 走 `/v2/` 协议，无需 docker CLI / daemon
+- ✅ **默认进本机 docker daemon**：`pull` 走 `docker-daemon` transport + unix socket/npipe，`docker images` 立即可见，无需外部 docker CLI
+- ✅ **纯 Registry API**：跨 registry 复制走 `/v2/` 协议，通过官方 `containers/image`，无 tar 中转
 - ✅ **官方引擎**：复用 `copy.Image`，bearer token、多架构、digest 校验开箱即用
 - ✅ **多架构选择**：多架构镜像可指定 `--platform linux/arm64`
 - ✅ **代理**：http/https/socks5，通过环境变量或 `--proxy` / `--socks5`
@@ -62,27 +63,28 @@ VERSION=v1.2.0 ./build.sh
 ### 使用
 
 ```bash
-# 1. 拉取 Docker Hub 镜像推送到本地 registry
+# 1. 拉取镜像到本机 docker daemon（默认），docker images 立即可见
+./dpull pull nginx:latest
+
+# 2. 拉取并推送到本地/内网 registry
 ./dpull pull nginx:latest --to localhost:5000
 
-# 2. 从私有仓库拉取
+# 3. 从私有仓库拉取到本机 docker daemon
 ./dpull pull myreg:5000/foo/bar:1.0 \
-    --to mirror:5000 \
     --username user --password pass \
     -k               # 私有没有 TLS
 
-# 3. 跨服务器复制到多个目标（并发）
+# 4. 跨服务器复制到多个目标（并发，copy 命令）
 ./dpull copy nginx:latest \
     --to 192.168.1.10:5000 \
     --to 192.168.1.11:5000
 
-# 4. 指定源，多目标
-./dpull copy myapp:2.0 --from myreg:5000 \
-    --to host-a:5000 --to host-b:5000
-
 # 5. 指定平台（多架构镜像）
 ./dpull pull redis:7 --platform linux/arm64 --to arm-cluster:5000
 ```
+
+> `pull` 默认渲染到本机 docker daemon（走 `unix:///var/run/docker.sock`，Windows 为 npipe）。
+> 可通过 `DOCKER_HOST` 环境变量指定其他 daemon 地址（如 `unix:///tmp/docker.sock` 或 `tcp://host:2375`）。
 
 ### 代理
 
@@ -109,9 +111,9 @@ export ALL_PROXY=socks5://127.0.0.1:10808            # 全流量代理
 
 ## 命令详解
 
-### `dpull pull <image> --to <registry>`
+### `dpull pull <image> [--to <registry>]`
 
-从 `image` 所在 registry 拉取并推送。镜像引用格式：
+拉取镜像。**默认渲染到本机 docker daemon**（`docker images` 立即可见，走 unix socket / npipe，不调用外部 docker CLI）；指定 `--to <registry>` 时推送到目标 registry。镜像引用格式：
 `[registry-host[:port]/][namespace/]name[:tag|@digest]`
 
 - 未指定 registry → Docker Hub
@@ -120,12 +122,16 @@ export ALL_PROXY=socks5://127.0.0.1:10808            # 全流量代理
 
 | 选项 | 说明 |
 |------|------|
-| `--to <reg>` | 目标 registry（必填，可含 `user:pass@` 或 `http(s)://` 前缀） |
+| `--to <reg>` | 目标 registry（可选，可含 `user:pass@` 或 `http(s)://` 前缀）；缺省送到本机 docker daemon |
 | `--to-username/--to-password` | 目标认证 |
 | `--to-insecure` | 目标使用 http/自签证书 |
 | `--proxy/--socks5/--no-proxy` | 代理（见上） |
 | `--platform os/arch` | 选择平台 |
 | `-C/--concurrency n` | blob 并发数（默认 4） |
+
+> **本机 daemon**：默认连接 `unix:///var/run/docker.sock`（Linux）/ npipe（Windows），
+> 通过 `DOCKER_HOST` 覆盖，如 `DOCKER_HOST=unix:///tmp/docker.sock ./dpull pull nginx`。
+> 需要当前用户对 socket 有权限（naive 组）或使用 `tcp://` 远程 daemon。
 
 ### `dpull copy <image> --to <dst>...`
 

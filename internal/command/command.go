@@ -70,6 +70,26 @@ func CopyImage(ctx context.Context, cfg *Config, srcEp, dstEp *transfer.Endpoint
 	})
 }
 
+// CopyImageToDaemon 从 registry 拉取 source 并渲染到本机 docker daemon（docker images 立即可见）。
+// daemonHost 为 daemon 地址（如 "unix:///var/run/docker.sock"）；为空则读取 DOCKER_HOST，
+// 仍为空则使用 docker 默认 unix socket。
+func CopyImageToDaemon(ctx context.Context, cfg *Config, srcEp *transfer.Endpoint,
+	source string, concurrency uint, platform *transfer.Platform) (*transfer.CopyResult, error) {
+	daemonHost := dockerHostFromEnv()
+	return transfer.DoCopyToDaemon(ctx, srcEp, source, daemonHost, transfer.CopyOpts{
+		Platform:    platform,
+		MaxParallel: concurrency,
+	})
+}
+
+// dockerHostFromEnv 返回 DOCKER_HOST 环境变量；用作 daemon 地址覆盖，未设置返回 ""。
+func dockerHostFromEnv() string {
+	if v := os.Getenv("DOCKER_HOST"); v != "" {
+		return v
+	}
+	return ""
+}
+
 // PlatformCurrent 返回当前平台。
 func PlatformCurrent() *transfer.Platform {
 	return &transfer.Platform{OS: runtime.GOOS, Arch: runtime.GOARCH}
