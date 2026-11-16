@@ -1,0 +1,11 @@
+# 统一换行为 LF，防止 Windows 上 CRLF 破坏 bash 脚本与生成内容
+* text=auto
+
+# bash 脚本必须保持 LF（CRLF 会导致 shebang / 运行出错）
+*.sh text eol=lf
+Makefile text eol=lf
+
+# Go 源码使用 LF
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf

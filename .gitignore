@@ -1,0 +1,12 @@
+# Binary/构建产物
+/dist/
+*.exe
+dpull
+dpull.exe
+
+# Go 缓存/编辑器
+/vendor/
+*.test
+*.out
+.idea/
+.vscode/
