@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 NAME="dpull"
 OUTPUT="${OUTPUT:-./dist}"
-VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo v0.1.0)}"
+VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo v0.2.0)}"
 BIN="${OUTPUT}/${NAME}-linux-amd64"
 
 echo "==> 编译 $NAME (linux/amd64) ${VERSION}"

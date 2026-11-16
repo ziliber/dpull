@@ -5,27 +5,37 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/ziliber/dpull/internal/command"
 	"github.com/ziliber/dpull/internal/transfer"
 )
 
-// cmdPull 实现 pull 子命令：拉取镜像，默认送到本机 docker daemon，或推送到指定 registry。
+// cmdPull 实现 pull 子命令：拉取镜像到本机 docker daemon。
+// 参数与 `docker pull` 尽量对齐，另支持代理与私有仓库认证。
 func cmdPull(args []string) int {
 	fs := flag.NewFlagSet("pull", flag.ExitOnError)
 	var c commonFlags
 	parseCommon(fs, &c)
 
-	var to, toUsername, toPassword string
-	var toInsecure bool
-	fs.StringVar(&to, "to", "", "目标 registry（如 localhost:5000 或 user:pass@host:5000）；缺省送到本机 docker daemon")
-	fs.StringVar(&toUsername, "to-username", "", "目标认证用户名")
-	fs.StringVar(&toPassword, "to-password", "", "目标认证密码")
-	fs.BoolVar(&toInsecure, "to-insecure", false, "目标使用 http 明文/自签证书")
+	var allTags bool
+	var quiet bool
+	var disableContentTrust bool
+	fs.BoolVar(&allTags, "all-tags", false, "下载仓库中所有 tag 的镜像")
+	fs.BoolVar(&allTags, "a", false, "下载仓库中所有 tag 的镜像（简写）")
+	fs.BoolVar(&quiet, "quiet", false, "抑制详细输出")
+	fs.BoolVar(&quiet, "q", false, "抑制详细输出（简写）")
+	fs.BoolVar(&disableContentTrust, "disable-content-trust", true, "跳过镜像验证（本工具始终不验证，保留兼容）")
+	_ = disableContentTrust
 	fs.Usage = func() { printPullUsage(fs) }
 
-	fs.Parse(args)
+	ordered, err := reorderFlags(fs, args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "解析参数: %v\n", err)
+		return 1
+	}
+	fs.Parse(ordered)
 	remain := fs.Args()
 	if len(remain) < 1 {
 		fs.Usage()
@@ -48,97 +58,96 @@ func cmdPull(args []string) int {
 
 	ctx := context.Background()
 	platform := parsePlatform(c.platform)
+	concurrency := uint(c.concurrent)
 
-	// 未指定 --to → 默认送到本机 docker daemon
-	if to == "" {
-		fmt.Fprintf(os.Stdout, "拉取 %s → 本机 docker daemon (unix socket)\n", image)
-		_, err := command.CopyImageToDaemon(ctx, cfg, srcEp, image, uint(c.concurrent), platform)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "拉取失败: %v\n", err)
-			return 1
-		}
-		fmt.Fprintln(os.Stdout, "完成。")
-		return 0
+	// --all-tags：列出仓库全部 tag，逐个拉取
+	if allTags {
+		return pullAllTags(ctx, cfg, srcEp, image, c.platform, concurrency, quiet)
 	}
 
-	// 指定 --to → 推送到目标 registry
-	toBase, toUser, toPass, toPlain, err := parseTarget(to)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "目标 %q 无效: %v\n", to, err)
-		return 1
+	if !quiet {
+		fmt.Fprintf(os.Stdout, "拉取 %s → 本机 docker daemon\n", image)
 	}
-	if toUser != "" {
-		toUsername = toUser
-	}
-	if toPass != "" {
-		toPassword = toPass
-	}
-	toInsecure = toInsecure || toPlain
-
-	// 目标端点（http:// 前缀或 --to-insecure → 允许 http/跳过证书）
-	dstInsecure := toInsecure || toPlain
-	dstEp, err := cfg.Endpoint(toBase, toUsername, toPassword, dstInsecure, dstInsecure)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "创建目标端点: %v\n", err)
-		return 1
-	}
-
-	fmt.Fprintf(os.Stdout, "拉取 %s → %s\n", image, dstEp.Registry)
-	res, err := command.CopyImage(ctx, cfg, srcEp, dstEp, image, uint(c.concurrent), platform)
+	_, err = command.CopyImageToDaemon(ctx, cfg, srcEp, image, concurrency, platform)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "拉取失败: %v\n", err)
 		return 1
 	}
-	_ = res
-	fmt.Fprintln(os.Stdout, "完成。")
+	if !quiet {
+		fmt.Fprintln(os.Stdout, "完成。")
+	}
 	return 0
 }
 
-// parseTarget 解析目标地址，支持 [http(s)://][user:pass@]host[:port] 形式。
-func parseTarget(s string) (base, user, pass string, plain bool, err error) {
-	if strings.HasPrefix(s, "http://") {
-		plain = true
-		s = strings.TrimPrefix(s, "http://")
-	} else if strings.HasPrefix(s, "https://") {
-		s = strings.TrimPrefix(s, "https://")
+// pullAllTags 列出仓库所有 tag 并逐个拉取到本机 daemon。
+func pullAllTags(ctx context.Context, cfg *command.Config, srcEp *transfer.Endpoint,
+	image, platform string, concurrency uint, quiet bool) int {
+
+	// 用仓库名（去 tag/digest）列出 tag
+	repoName := stripTag(image)
+	tags, err := command.ListRepositoryTags(ctx, cfg, srcEp, repoName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "列出仓库 tag 失败: %v\n", err)
+		return 1
 	}
-	if at := strings.LastIndex(s, "@"); at >= 0 {
-		ui := s[:at]
-		base = s[at+1:]
-		if colon := strings.Index(ui, ":"); colon >= 0 {
-			user, pass = ui[:colon], ui[colon+1:]
-		} else {
-			user = ui
+	sort.Strings(tags)
+	if len(tags) == 0 {
+		fmt.Fprintln(os.Stderr, "仓库没有可用 tag。")
+		return 1
+	}
+
+	if !quiet {
+		fmt.Fprintf(os.Stdout, "仓库 %s 共 %d 个 tag:\n", repoName, len(tags))
+	}
+	for i, tag := range tags {
+		ref := strings.TrimSuffix(repoName, ":") + ":" + tag
+		if !quiet {
+			fmt.Fprintf(os.Stdout, "[%d/%d] 拉取 %s\n", i+1, len(tags), ref)
 		}
-	} else {
-		base = s
+		if _, err := command.CopyImageToDaemon(ctx, cfg, srcEp, ref, concurrency, parsePlatform(platform)); err != nil {
+			fmt.Fprintf(os.Stderr, "拉取 %s 失败: %v\n", ref, err)
+			return 1
+		}
 	}
-	base = strings.TrimSuffix(base, "/")
-	if base == "" {
-		err = fmt.Errorf("缺少主机")
+	if !quiet {
+		fmt.Fprintln(os.Stdout, "全部完成。")
 	}
-	return
+	return 0
+}
+
+// stripTag 去掉引用的 tag/digest 部分，保留仓库名（registry+namespace+name）。
+func stripTag(image string) string {
+	if i := strings.Index(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	if i := strings.LastIndex(image, ":"); i >= 0 {
+		// 避免 IPv6 地址端口被误判（如 [::1]:5000）——简单处理：只在包含 "/" 之后的冒号为 tag
+		if strings.Contains(image[:i], "/") {
+			image = image[:i]
+		}
+	}
+	return image
 }
 
 func printPullUsage(fs *flag.FlagSet) {
-	fmt.Fprintf(os.Stderr, `用法: dpull pull <image> [--to <registry>] [选项]
+	fmt.Fprintf(os.Stderr, `用法: dpull pull [OPTIONS] NAME[:TAG|@DIGEST]
 
-拉取镜像，默认渲染到本机 docker daemon（docker images 立即可见，走 unix socket），
-也可指定 --to 推送到远程 registry（基于 containers/image，不依赖 docker CLI）。
+从 registry 拉取镜像到本机 docker daemon（docker images 立即可见），
+走 unix socket / tcp，不调用外部 docker CLI。参数与 `+"`docker pull`"+` 尽量对齐。
 
 示例:
-  dpull pull nginx:latest                       # 拉到本机 docker daemon
-  dpull pull nginx:latest --to localhost:5000   # 拉取并推送到本地 registry
-  dpull pull redis:7 --to 192.168.1.10:5000 --platform linux/arm64
-  dpull pull mypriv:5000/app:1.0 --to mirror:5000 \
-      --username u --password p -k
+  dpull pull nginx:latest
+  dpull pull redis                              # 默认 latest
+  dpull pull alpine --platform linux/arm64
+  dpull pull -a library/redis                   # 拉取所有 tag
+  dpull pull mypriv:5000/app:1.0 -u user -p pass -k
 
 本机 daemon 地址默认 unix:///var/run/docker.sock，可用 DOCKER_HOST 覆盖。
 
 选项:
 `)
 	fs.PrintDefaults()
-	fmt.Fprintf(os.Stderr, "\n镜像未指定 registry 时默认 Docker Hub。\n")
+	fmt.Fprintf(os.Stderr, `
+镜像未指定 registry 时默认 Docker Hub；未指定 tag 默认 latest。
+`)
 }
-
-var _ = transfer.CopyResult{}

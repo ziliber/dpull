@@ -1,11 +1,10 @@
-// Package command 实现顶层命令逻辑（pull / copy）。
+// Package command 实现顶层命令逻辑（pull / save）。
 package command
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"runtime"
 
@@ -30,26 +29,14 @@ func NewConfig() *Config {
 	}
 }
 
-// ProxyURL 返回合并后的代理 URL（socks5 优先），无代理返回 nil。
-func (c *Config) ProxyURL() (*url.URL, error) {
-	raw := c.Proxy.SocksProxy
-	if raw == "" {
-		raw = c.Proxy.HTTPProxy
-	}
-	if raw == "" {
-		return nil, nil
-	}
-	return proxy.ParseURL(raw)
-}
-
-// Endpoint 从 registry + 认证 + insecure 构建 transfer.Endpoint，并合并代理（含 NO_PROXY）。
+// Endpoint 从 registry + 认证 + insecure 构建 transfer.Endpoint，并注入代理环境变量。
+//
+// 代理不写入 transfer.Endpoint：containers/image 内部 transport 仅支持 http(s) 代理
+// （http.ProxyURL），对 socks5 无效。因此统一注入 HTTP_PROXY/HTTPS_PROXY/NO_PROXY，
+// 交由 c/image 默认的 http.ProxyFromEnvironment 处理——Go 标准库原生支持 socks5 代理。
 func (c *Config) Endpoint(registry, user, pass string, insecure, plainHTTP bool) (*transfer.Endpoint, error) {
-	p, err := c.ProxyURL()
-	if err != nil {
+	if err := c.injectProxyEnv(); err != nil {
 		return nil, err
-	}
-	if p != nil && c.Proxy.NoProxy != "" && proxy.MatchNoProxy(c.Proxy.NoProxy, registry) {
-		p = nil
 	}
 	return &transfer.Endpoint{
 		Registry:      registry,
@@ -57,17 +44,29 @@ func (c *Config) Endpoint(registry, user, pass string, insecure, plainHTTP bool)
 		Password:      pass,
 		PlainHTTP:     plainHTTP,
 		SkipTLSVerify: insecure,
-		ProxyURL:      p,
 	}, nil
 }
 
-// CopyImage 复制镜像：source 为完整源引用，src 为推断/指定的源端点，dst 为目标端点。
-func CopyImage(ctx context.Context, cfg *Config, srcEp, dstEp *transfer.Endpoint,
-	source string, concurrency uint, platform *transfer.Platform) (*transfer.CopyResult, error) {
-	return transfer.DoCopy(ctx, srcEp, dstEp, source, "", transfer.CopyOpts{
-		Platform:    platform,
-		MaxParallel: concurrency,
-	})
+// injectProxyEnv 把代理配置写入 HTTP_PROXY/HTTPS_PROXY/NO_PROXY 环境变量。
+// socks5 优先于 http(s)；NO_PROXY 交由 http.ProxyFromEnvironment 原生处理。
+func (c *Config) injectProxyEnv() error {
+	raw := c.Proxy.SocksProxy
+	if raw == "" {
+		raw = c.Proxy.HTTPProxy
+	}
+	if raw == "" {
+		return nil
+	}
+	if _, err := proxy.ParseURL(raw); err != nil {
+		return err
+	}
+	// 裸地址补 scheme 交给 proxy.ParseURL 已校验；直接注入（透传原样）。
+	os.Setenv("HTTP_PROXY", raw)
+	os.Setenv("HTTPS_PROXY", raw)
+	if c.Proxy.NoProxy != "" {
+		os.Setenv("NO_PROXY", c.Proxy.NoProxy)
+	}
+	return nil
 }
 
 // CopyImageToDaemon 从 registry 拉取 source 并渲染到本机 docker daemon（docker images 立即可见）。
@@ -80,6 +79,20 @@ func CopyImageToDaemon(ctx context.Context, cfg *Config, srcEp *transfer.Endpoin
 		Platform:    platform,
 		MaxParallel: concurrency,
 	})
+}
+
+// CopyImageToArchive 从 registry 拉取 source 并保存为 docker-archive tar 包（docker load 可导入）。
+func CopyImageToArchive(ctx context.Context, cfg *Config, srcEp *transfer.Endpoint,
+	source, outputPath string, concurrency uint, platform *transfer.Platform) (*transfer.CopyResult, error) {
+	return transfer.DoCopyToArchive(ctx, srcEp, source, outputPath, transfer.CopyOpts{
+		Platform:    platform,
+		MaxParallel: concurrency,
+	})
+}
+
+// ListRepositoryTags 列出 source 仓库的全部 tag（用于 pull --all-tags）。
+func ListRepositoryTags(ctx context.Context, cfg *Config, srcEp *transfer.Endpoint, source string) ([]string, error) {
+	return transfer.ListRepositoryTags(ctx, srcEp, source)
 }
 
 // dockerHostFromEnv 返回 DOCKER_HOST 环境变量；用作 daemon 地址覆盖，未设置返回 ""。

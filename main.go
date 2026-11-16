@@ -1,23 +1,24 @@
-// Command dpull 是一个纯 Registry API 的 Docker 镜像拉取/同步工具。
+// Command dpull 是一个 Docker 镜像拉取工具，基于官方 containers/image 引擎。
 //
 // 功能：
-//   - pull: 从远程仓库拉取镜像，推送到本地/目标 registry
-//   - copy: 将一个源镜像分发复制到多个目标 registry
+//   - pull: 从远程仓库拉取镜像到本机 docker daemon（unix socket / tcp）
+//   - save: 拉取镜像并保存为 docker-archive tar 包（docker load 可导入）
 //
-// 不使用外部 docker CLI，通过 Docker Registry HTTP API v2 实现。
+// 不调用外部 docker CLI，通过 containers/image 的 transport 实现。
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/ziliber/dpull/internal/command"
 	"github.com/ziliber/dpull/internal/proxy"
 	"github.com/ziliber/dpull/internal/transfer"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -32,8 +33,8 @@ func run(args []string) int {
 	switch args[0] {
 	case "pull", "p":
 		return cmdPull(args[1:])
-	case "copy", "cp":
-		return cmdCopy(args[1:])
+	case "save":
+		return cmdSave(args[1:])
 	case "help", "-h", "--help", "-help":
 		printUsage()
 		return 0
@@ -70,11 +71,11 @@ func (c *commonFlags) buildConfig() (*command.Config, error) {
 
 // Usage 输出用法。
 func printUsage() {
-	fmt.Fprintf(os.Stdout, `dpull %s - 纯 Registry API 的 Docker 镜像拉取/复制工具（无需本机 docker）
+	fmt.Fprintf(os.Stdout, `dpull %s - 拉取镜像到本机 docker daemon / 保存为 tar 包
 
 用法:
-  dpull pull <image> [--to <registry>] [选项]   拉取镜像并推送到目标 registry
-  dpull copy <image> [--from <src>] [--to <dst>...] [选项]   跨 registry 分发镜像
+  dpull pull <image> [选项]      从 registry 拉取镜像到本机 docker daemon
+  dpull save <image> -o <file>   从 registry 拉取并保存为 docker-archive tar 包
   dpull help / version
 
 镜像引用格式:
@@ -88,8 +89,8 @@ func printUsage() {
   --username, -u <name>    认证用户名
   --password, -p <pass>    认证密码
   --insecure, -k           允许 http 明文 / 自签证书（针对本地/私有 registry）
-  --concurrency, -C <n>    blob 并发上传数（默认 4）
-  --platform <os/arch>     多架构镜像选择平台，如 linux/arm64（默认 linux/amd64）
+  --concurrency, -C <n>    blob 并发下载数（默认 4）
+  --platform <os/arch>     多架构镜像选择平台，如 linux/arm64
 
 运行 'dpull <命令> --help' 查看子命令帮助。
 `, version)
@@ -126,4 +127,51 @@ func splitPlatform(s string) (osName, arch string) {
 		}
 	}
 	return "linux", s
+}
+
+// reorderFlags 将位置参数（镜像名）之后的 flag 重排到最前，使 flag 可放在镜像名后。
+// Go 的 flag.Parse 遇到第一个非 flag 参数即停止解析，这与 docker pull 的用法不一致。
+// 这里通过 flag.Value 的 IsBoolFlag 判断某 flag 是否消费值，从而在保持副本的情况下重排。
+func reorderFlags(fs *flag.FlagSet, args []string) ([]string, error) {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			// 之后的全部作为位置参数
+			pos = append(pos, args[i:]...)
+			break
+		}
+		if len(a) >= 2 && a[0] == '-' {
+			flags = append(flags, a)
+			name := strings.TrimLeft(a, "-")
+			// 处理 --flag=value 形式：不消费下一个参数
+			hasEqual := false
+			if eq := strings.Index(name, "="); eq >= 0 {
+				name = name[:eq]
+				hasEqual = true
+			}
+			f := fs.Lookup(name)
+			if f == nil {
+				return nil, fmt.Errorf("未知 flag: %s", a)
+			}
+			// 若 flag 消费值且非 --flag=value 形式，则把下一个参数也归入 flag 列表
+			if !hasEqual && flagNeedsValue(f.Value) && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			pos = append(pos, a)
+		}
+	}
+	// 返回 flag 在前、位置参数在后的重排结果
+	return append(flags, pos...), nil
+}
+
+// flagNeedsValue 判断 flag.Value 是否需要消费一个参数值。
+// bool 类型 flag（实现了 IsBoolFlag() bool 且返回 true）不消费值。
+func flagNeedsValue(v flag.Value) bool {
+	if bf, ok := v.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+		return false
+	}
+	return true
 }

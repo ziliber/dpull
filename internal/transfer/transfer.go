@@ -1,24 +1,27 @@
-// Package transfer 基于 github.com/containers/image 提供跨 registry 镜像复制。
+// Package transfer 基于 github.com/containers/image 提供镜像拉取能力。
 //
-// 这是 copy/pull 的核心引擎，替代早期手写的 Registry v2 客户端，
-// 以获得各厂商 registry 的成熟兼容性（同 skopeo/podman 底层）。
+// 本工具只与两种目标通信：
+//   - docker daemon（通过 unix socket / tcp，docker-daemon transport）
+//   - docker-archive tar 包（docker load 可导入）
+//
+// 源始终为 registry（Docker Hub / 私有仓库），基于官方 containers/image，
+// 与 skopeo/podman 同源的成熟实现。
 package transfer
 
 import (
 	"context"
 	"fmt"
-	"net/url"
-	"strings"
 
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker"
+	"github.com/containers/image/v5/docker/archive"
 	"github.com/containers/image/v5/docker/daemon"
 	"github.com/containers/image/v5/signature"
 	"github.com/containers/image/v5/types"
 	"github.com/distribution/reference"
 )
 
-// Endpoint 描述一个源或目标的 registry 连接参数。
+// Endpoint 描述源 registry 的连接参数。
 type Endpoint struct {
 	// Registry 为 registry 主机（含端口），如 "registry-1.docker.io"、"192.168.1.10:5000"
 	Registry string
@@ -30,8 +33,6 @@ type Endpoint struct {
 	PlainHTTP bool
 	// SkipTLSVerify 为 true 时跳过 TLS 证书校验。
 	SkipTLSVerify bool
-	// ProxyURL 为可选代理（支持 http/https/socks5）。
-	ProxyURL *url.URL
 }
 
 // Platform 表示目标平台。
@@ -41,15 +42,15 @@ type Platform struct {
 	Variant string
 }
 
-// CopyOpts 为一次复制行为的配置。
+// CopyOpts 为一次拉取的配置。
 type CopyOpts struct {
-	// Platform 指定要复制的平台；空则复制源默认平台。
+	// Platform 指定要拉取的平台；空则拉取源默认平台。
 	Platform *Platform
 	// MaxParallel 为并行的 blob 下载数；0 使用库默认。
 	MaxParallel uint
 }
 
-// CopyResult 记录复制结果。
+// CopyResult 记录拉取结果。
 type CopyResult struct {
 	CopiedManifest []byte
 }
@@ -65,133 +66,10 @@ func ParseSourceRef(image string) (reference.Named, string, error) {
 	return reference.TagNameOnly(n), reference.Domain(n), nil
 }
 
-// DoCopy 将 source 指定的镜像从 src 复制到 dst，目标 tag 为 dstTag。
-// source 为完整或局部引用；若 src.Registry 为空或为默认，则用引用推断的 registry。
-// dstTag 为目标 tag；为空则用源 tag。
-func DoCopy(ctx context.Context, src, dst *Endpoint, source, dstTag string, opts CopyOpts) (*CopyResult, error) {
-	// 1. 解析源引用，得到完整 named 与推断的 registry
-	srcNamed, inferredRegistry, err := ParseSourceRef(source)
-	if err != nil {
-		return nil, err
-	}
-	if src.Registry == "" || defaultRegistry(src.Registry) {
-		src.Registry = inferredRegistry
-	}
-
-	// 2. 源 tag（默认 latest）
-	srcTag := tagOfNamed(srcNamed)
-	if dstTag == "" {
-		dstTag = srcTag
-	}
-
-	// 3. 构造目标引用：dst.Registry + 源仓库路径:目标tag
-	srcPath := reference.Path(srcNamed)
-	dstNamed, err := ParseTargetRef(dst.Registry, srcPath, dstTag)
-	if err != nil {
-		return nil, err
-	}
-
-	// 4. 传输引用
-	srcRef, err := docker.NewReference(srcNamed)
-	if err != nil {
-		return nil, fmt.Errorf("构造源引用: %w", err)
-	}
-	dstRef, err := docker.NewReference(dstNamed)
-	if err != nil {
-		return nil, fmt.Errorf("构造目标引用: %w", err)
-	}
-
-	// 5. 安全策略：不要求签名
-	policyCtx, err := defaultPolicyCtx()
-	if err != nil {
-		return nil, err
-	}
-	defer policyCtx.Destroy()
-
-	// 6. 平台选择在源上下文指定
-	srcSys := readSysCtx(src, opts.Platform)
-	dstSys := readSysCtx(dst, nil)
-
-	// 7. 执行复制
-	manifest, err := copy.Image(ctx, policyCtx, dstRef, srcRef, &copy.Options{
-		SourceCtx:            srcSys,
-		DestinationCtx:       dstSys,
-		MaxParallelDownloads: opts.MaxParallel,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("复制镜像: %w", err)
-	}
-	return &CopyResult{CopiedManifest: manifest}, nil
-}
-
-// ParseTargetRef 由 registry 主机 + 仓库路径(无 tag) + tag 组合目标引用。
-func ParseTargetRef(registry, path, tag string) (reference.Named, error) {
-	full := strings.TrimSuffix(registry, "/") + "/" + path + ":" + tag
-	n, err := reference.ParseNormalizedNamed(full)
-	if err != nil {
-		return nil, fmt.Errorf("解析目标引用 %q: %w", full, err)
-	}
-	return reference.TagNameOnly(n), nil
-}
-
-// readSysCtx 构建某端点的 SystemContext（认证、TLS、代理、平台）。
-func readSysCtx(e *Endpoint, platform *Platform) *types.SystemContext {
-	s := &types.SystemContext{}
-	if e.Username != "" || e.Password != "" {
-		s.DockerAuthConfig = &types.DockerAuthConfig{
-			Username: e.Username,
-			Password: e.Password,
-		}
-	}
-	if e.PlainHTTP || e.SkipTLSVerify {
-		s.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
-	}
-	if e.ProxyURL != nil {
-		s.DockerProxyURL = e.ProxyURL
-	}
-	if platform != nil {
-		s.ArchitectureChoice = platform.Arch
-		s.OSChoice = platform.OS
-		s.VariantChoice = platform.Variant
-	}
-	return s
-}
-
-// tagOfNamed 返回 Named 引用的 tag；无 tag 返回 "latest"。
-func tagOfNamed(n reference.Named) string {
-	if t, ok := n.(reference.Tagged); ok {
-		return t.Tag()
-	}
-	return "latest"
-}
-
-// defaultRegistry 判断是否使用 Docker Hub 默认 registry。
-func defaultRegistry(r string) bool {
-	switch r {
-	case "docker.io", "index.docker.io", "registry-1.docker.io":
-		return true
-	}
-	return false
-}
-
-// defaultPolicyCtx 构造"仅本地信任、不要求远程签名"的默认安全策略上下文。
-// 对本工具（拉取/分发，不验证签名）足够；与 skopeo 默认行为一致。
-func defaultPolicyCtx() (*signature.PolicyContext, error) {
-	policy, err := signature.DefaultPolicy(&types.SystemContext{})
-	if err != nil {
-		return nil, fmt.Errorf("构造默认策略: %w", err)
-	}
-	policyCtx, err := signature.NewPolicyContext(policy)
-	if err != nil {
-		return nil, fmt.Errorf("构造策略上下文: %w", err)
-	}
-	return policyCtx, nil
-}
-
-// DoCopyToDaemon 将源镜像复制到本机（或指定）docker daemon，使 `docker images` 立即可见。
+// DoCopyToDaemon 将源镜像拉取到本机（或指定）docker daemon，使 `docker images` 立即可见。
 // 通过 docker-daemon transport 走 unix socket（Linux）或 npipe（Windows），不调用外部 docker CLI。
 //
-//   - src 为源 registry 端点（认证、TLS、代理、平台）。
+//   - src 为源 registry 端点（认证、TLS、代理）。
 //   - source 为源镜像引用，如 "nginx"、"nginx:1.25"、"myreg:5000/foo/bar:1.0"。
 //   - daemonHost 指定 daemon 地址，如 "unix:///var/run/docker.sock"、""（默认）
 //     或 "tcp://127.0.0.1:2375"；可用 DOCKER_HOST 语义覆盖。
@@ -238,7 +116,56 @@ func DoCopyToDaemon(ctx context.Context, src *Endpoint, source, daemonHost strin
 		MaxParallelDownloads: opts.MaxParallel,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("复制镜像到 docker daemon: %w", err)
+		return nil, fmt.Errorf("拉取到 docker daemon: %w", err)
+	}
+	return &CopyResult{CopiedManifest: manifest}, nil
+}
+
+// DoCopyToArchive 将源镜像拉取并保存为 docker-archive tar 包（`docker load` 可直接导入）。
+//
+//   - src 为源 registry 端点（认证、TLS、代理）。
+//   - source 为源镜像引用，如 "nginx"、"nginx:1.25"。
+//   - outputPath 为输出 tar 文件路径（不存在会自动创建）。
+//   - opts.Platform 用于多架构镜像选择平台；tar 也只能保存单平台。
+func DoCopyToArchive(ctx context.Context, src *Endpoint, source, outputPath string, opts CopyOpts) (*CopyResult, error) {
+	// 1. 解析源引用
+	srcNamed, inferredRegistry, err := ParseSourceRef(source)
+	if err != nil {
+		return nil, err
+	}
+	if src.Registry == "" || defaultRegistry(src.Registry) {
+		src.Registry = inferredRegistry
+	}
+
+	// 2. 构造 docker-archive 目标引用：路径 + tar 内镜像名（名:tag）
+	dstRef, err := archiveDestRef(srcNamed, outputPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. 源引用
+	srcRef, err := docker.NewReference(srcNamed)
+	if err != nil {
+		return nil, fmt.Errorf("构造源引用: %w", err)
+	}
+
+	// 4. 安全策略
+	policyCtx, err := defaultPolicyCtx()
+	if err != nil {
+		return nil, err
+	}
+	defer policyCtx.Destroy()
+
+	// 5. SystemContext：源带平台/认证/代理
+	srcSys := readSysCtx(src, opts.Platform)
+
+	// 6. 执行复制（registry 源 → docker-archive 目标）
+	manifest, err := copy.Image(ctx, policyCtx, dstRef, srcRef, &copy.Options{
+		SourceCtx:            srcSys,
+		MaxParallelDownloads: opts.MaxParallel,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("保存镜像到 %s: %w", outputPath, err)
 	}
 	return &CopyResult{CopiedManifest: manifest}, nil
 }
@@ -252,4 +179,96 @@ func daemonDestRef(srcNamed reference.Named) (types.ImageReference, error) {
 		return nil, fmt.Errorf("构造 daemon 目标引用 %q: %w", familiar, err)
 	}
 	return ref, nil
+}
+
+// archiveDestRef 由源引用 + 输出路径构造 docker-archive 目标引用。
+// tar 内镜像名为源引用的 familiar 短名（如 "nginx:latest"）。
+func archiveDestRef(srcNamed reference.Named, outputPath string) (types.ImageReference, error) {
+	if outputPath == "" {
+		return nil, fmt.Errorf("输出路径为空")
+	}
+	// 源引用经 TagNameOnly 处理后必含 tag，可安全断言为 NamedTagged
+	familiar := reference.FamiliarString(srcNamed)
+	dstNamed, err := reference.ParseNormalizedNamed(familiar)
+	if err != nil {
+		return nil, fmt.Errorf("解析 archive 目标名 %q: %w", familiar, err)
+	}
+	namedTagged, ok := dstNamed.(reference.NamedTagged)
+	if !ok {
+		// 理论上不会走到：TagNameOnly 保证有 tag。此处防御性兜底。
+		namedTagged, err = reference.WithTag(dstNamed, "latest")
+		if err != nil {
+			return nil, fmt.Errorf("构造 archive 目标名: %w", err)
+		}
+	}
+	ref, err := archive.NewReference(outputPath, namedTagged)
+	if err != nil {
+		return nil, fmt.Errorf("构造 archive 目标引用: %w", err)
+	}
+	return ref, nil
+}
+
+// readSysCtx 构建源端点的 SystemContext（认证、TLS、代理、平台）。
+func readSysCtx(e *Endpoint, platform *Platform) *types.SystemContext {
+	s := &types.SystemContext{}
+	if e.Username != "" || e.Password != "" {
+		s.DockerAuthConfig = &types.DockerAuthConfig{
+			Username: e.Username,
+			Password: e.Password,
+		}
+	}
+	if e.PlainHTTP || e.SkipTLSVerify {
+		s.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
+	}
+	if platform != nil {
+		s.ArchitectureChoice = platform.Arch
+		s.OSChoice = platform.OS
+		s.VariantChoice = platform.Variant
+	}
+	return s
+}
+
+// defaultRegistry 判断是否使用 Docker Hub 默认 registry。
+func defaultRegistry(r string) bool {
+	switch r {
+	case "docker.io", "index.docker.io", "registry-1.docker.io":
+		return true
+	}
+	return false
+}
+
+// defaultPolicyCtx 构造"接受一切、不验证远程签名"的默认策略上下文。
+// 本工具不做镜像签名验证（与 skopeo --insecure-policy 或国内镜像场景一致），
+// 且不要求系统存在 /etc/containers/policy.json，故用内存构造而非读取配置文件。
+func defaultPolicyCtx() (*signature.PolicyContext, error) {
+	policy := &signature.Policy{
+		Default: signature.PolicyRequirements{signature.NewPRInsecureAcceptAnything()},
+	}
+	policyCtx, err := signature.NewPolicyContext(policy)
+	if err != nil {
+		return nil, fmt.Errorf("构造策略上下文: %w", err)
+	}
+	return policyCtx, nil
+}
+
+// ListRepositoryTags 列出 source 所在仓库的全部 tag（用于 --all-tags）。
+// source 可为仓库名（tag 会被忽略），如 "nginx"；返回该仓库所有 tag 字符串。
+func ListRepositoryTags(ctx context.Context, src *Endpoint, source string) ([]string, error) {
+	srcNamed, inferredRegistry, err := ParseSourceRef(source)
+	if err != nil {
+		return nil, err
+	}
+	if src.Registry == "" || defaultRegistry(src.Registry) {
+		src.Registry = inferredRegistry
+	}
+	srcRef, err := docker.NewReference(srcNamed)
+	if err != nil {
+		return nil, fmt.Errorf("构造源引用: %w", err)
+	}
+	sys := readSysCtx(src, nil)
+	tags, err := docker.GetRepositoryTags(ctx, sys, srcRef)
+	if err != nil {
+		return nil, fmt.Errorf("列出仓库 tag: %w", err)
+	}
+	return tags, nil
 }

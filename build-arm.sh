@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 NAME="dpull"
 OUTPUT="${OUTPUT:-./dist}"
-VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo v0.1.0)}"
+VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo v0.2.0)}"
 
 # 默认编译 ARM64；可通过 ARCH=v7 编译 32 位 ARM
 ARCH_MODE="${ARCH:-arm64}"
