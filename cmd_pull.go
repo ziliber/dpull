@@ -7,10 +7,15 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ziliber/dpull/internal/command"
 	"github.com/ziliber/dpull/internal/transfer"
+	"github.com/ziliber/dpull/internal/ui"
 )
+
+// progressInterval 进度事件上报间隔；越小越平滑，过大会让进度条有停顿感。
+const progressInterval = 200 * time.Millisecond
 
 // cmdPull 实现 pull 子命令：拉取镜像到本机 docker daemon。
 // 参数与 `docker pull` 尽量对齐，另支持代理与私有仓库认证。
@@ -60,15 +65,20 @@ func cmdPull(args []string) int {
 	platform := parsePlatform(c.platform)
 	concurrency := uint(c.concurrent)
 
+	// 进度渲染（TTY 且非 -q 时生效）
+	prog := ui.NewProgress(os.Stdout, quiet)
+	defer prog.Close()
+
 	// --all-tags：列出仓库全部 tag，逐个拉取
 	if allTags {
-		return pullAllTags(ctx, cfg, srcEp, image, c.platform, concurrency, quiet)
+		return pullAllTags(ctx, cfg, srcEp, image, c.platform, concurrency, quiet, prog)
 	}
 
 	if !quiet {
 		fmt.Fprintf(os.Stdout, "拉取 %s → 本机 docker daemon\n", image)
 	}
-	_, err = command.CopyImageToDaemon(ctx, cfg, srcEp, image, concurrency, platform)
+	_, err = command.CopyImageToDaemon(ctx, cfg, srcEp, image, concurrency, platform,
+		prog.Channel(), progressInterval)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "拉取失败: %v\n", err)
 		return 1
@@ -81,7 +91,7 @@ func cmdPull(args []string) int {
 
 // pullAllTags 列出仓库所有 tag 并逐个拉取到本机 daemon。
 func pullAllTags(ctx context.Context, cfg *command.Config, srcEp *transfer.Endpoint,
-	image, platform string, concurrency uint, quiet bool) int {
+	image, platform string, concurrency uint, quiet bool, prog *ui.Progress) int {
 
 	// 用仓库名（去 tag/digest）列出 tag
 	repoName := stripTag(image)
@@ -104,7 +114,8 @@ func pullAllTags(ctx context.Context, cfg *command.Config, srcEp *transfer.Endpo
 		if !quiet {
 			fmt.Fprintf(os.Stdout, "[%d/%d] 拉取 %s\n", i+1, len(tags), ref)
 		}
-		if _, err := command.CopyImageToDaemon(ctx, cfg, srcEp, ref, concurrency, parsePlatform(platform)); err != nil {
+		if _, err := command.CopyImageToDaemon(ctx, cfg, srcEp, ref, concurrency,
+			parsePlatform(platform), prog.Channel(), progressInterval); err != nil {
 			fmt.Fprintf(os.Stderr, "拉取 %s 失败: %v\n", ref, err)
 			return 1
 		}

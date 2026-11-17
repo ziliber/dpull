@@ -58,7 +58,7 @@ func cmdSave(args []string) int {
 	platform := parsePlatform(c.platform)
 
 	fmt.Fprintf(os.Stdout, "保存 %s → %s\n", image, target)
-	_, err = command.CopyImageToArchive(ctx, cfg, srcEp, image, target, uint(c.concurrent), platform)
+	_, err = command.CopyImageToArchive(ctx, cfg, srcEp, image, target, uint(c.concurrent), platform, nil, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "保存失败: %v\n", err)
 		return 1

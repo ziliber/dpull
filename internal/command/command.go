@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"time"
 
+	"github.com/containers/image/v5/types"
 	"github.com/ziliber/dpull/internal/proxy"
 	"github.com/ziliber/dpull/internal/transfer"
 )
@@ -72,21 +74,28 @@ func (c *Config) injectProxyEnv() error {
 // CopyImageToDaemon 从 registry 拉取 source 并渲染到本机 docker daemon（docker images 立即可见）。
 // daemonHost 为 daemon 地址（如 "unix:///var/run/docker.sock"）；为空则读取 DOCKER_HOST，
 // 仍为空则使用 docker 默认 unix socket。
+// progress 为可选进度事件通道；progressInterval 为事件上报间隔，progress 非空时生效。
 func CopyImageToDaemon(ctx context.Context, cfg *Config, srcEp *transfer.Endpoint,
-	source string, concurrency uint, platform *transfer.Platform) (*transfer.CopyResult, error) {
+	source string, concurrency uint, platform *transfer.Platform,
+	progress chan types.ProgressProperties, progressInterval time.Duration) (*transfer.CopyResult, error) {
 	daemonHost := dockerHostFromEnv()
 	return transfer.DoCopyToDaemon(ctx, srcEp, source, daemonHost, transfer.CopyOpts{
-		Platform:    platform,
-		MaxParallel: concurrency,
+		Platform:         platform,
+		MaxParallel:      concurrency,
+		Progress:         progress,
+		ProgressInterval: progressInterval,
 	})
 }
 
 // CopyImageToArchive 从 registry 拉取 source 并保存为 docker-archive tar 包（docker load 可导入）。
 func CopyImageToArchive(ctx context.Context, cfg *Config, srcEp *transfer.Endpoint,
-	source, outputPath string, concurrency uint, platform *transfer.Platform) (*transfer.CopyResult, error) {
+	source, outputPath string, concurrency uint, platform *transfer.Platform,
+	progress chan types.ProgressProperties, progressInterval time.Duration) (*transfer.CopyResult, error) {
 	return transfer.DoCopyToArchive(ctx, srcEp, source, outputPath, transfer.CopyOpts{
-		Platform:    platform,
-		MaxParallel: concurrency,
+		Platform:         platform,
+		MaxParallel:      concurrency,
+		Progress:         progress,
+		ProgressInterval: progressInterval,
 	})
 }
 

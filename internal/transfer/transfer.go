@@ -11,6 +11,7 @@ package transfer
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker"
@@ -48,6 +49,10 @@ type CopyOpts struct {
 	Platform *Platform
 	// MaxParallel 为并行的 blob 下载数；0 使用库默认。
 	MaxParallel uint
+	// Progress 为可选进度事件通道；非空时以 ProgressInterval 间隔上报下载进度。
+	// 事件类型见 github.com/containers/image/v5/types.ProgressProperties。
+	Progress         chan types.ProgressProperties
+	ProgressInterval time.Duration
 }
 
 // CopyResult 记录拉取结果。
@@ -114,6 +119,8 @@ func DoCopyToDaemon(ctx context.Context, src *Endpoint, source, daemonHost strin
 		SourceCtx:            srcSys,
 		DestinationCtx:       dstSys,
 		MaxParallelDownloads: opts.MaxParallel,
+		Progress:             opts.Progress,
+		ProgressInterval:     opts.ProgressInterval,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("拉取到 docker daemon: %w", err)
@@ -163,6 +170,8 @@ func DoCopyToArchive(ctx context.Context, src *Endpoint, source, outputPath stri
 	manifest, err := copy.Image(ctx, policyCtx, dstRef, srcRef, &copy.Options{
 		SourceCtx:            srcSys,
 		MaxParallelDownloads: opts.MaxParallel,
+		Progress:             opts.Progress,
+		ProgressInterval:     opts.ProgressInterval,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("保存镜像到 %s: %w", outputPath, err)
